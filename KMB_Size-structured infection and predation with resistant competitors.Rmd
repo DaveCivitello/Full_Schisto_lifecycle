@@ -1,0 +1,948 @@
+---
+title: "Schisto IBM with size-structured transmission and predation"
+author: "DJC"
+date: "8/11/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Schisto DEBIBM with size-structured transmission and predation
+Simulations to examine the effects of simultaneous size-dependent transmission and predation on schisto transmission potential in a seasonal scenario.
+
+### Starting functionality (3/1/2022)
+* IBM based on DEB for individual snails (parameterized from Civitello et al. 2020 Proc B)
+* density-dependent transmission model (with size-independent exposure and susceptibility; parameterized by Civitello and Rohr, 2014 JAE)
+* Resource production model that allows for logistically growing algae and non-reproductive detritus inputs
+
+### Newly added features
+* Full schistosome life cycle (3/23/2023)
+  + Implemented a human infection function, uses the exposure-susceptibility framework
+  + Implemented a worm development function, which uses the "Linear chain trick" to match mean and variance of development times
+  + Implemented egg deposition back into the environment by infected hosts using the eggs per 10 mL urine vs worm pair relationship from (Ines Neves et al. 2021 PLOS NTDs)
+* Resistant competitors (3/22/2023)
+  + Implemented a state variable for focal vs. nonfocal snails
+    + Focal snails act as all snails previously have - they are potential intermediate hosts of schisto
+    + Nonfocal snails are resistant competitors - they cannot get infected
+    + Nonfocal snails compete for algae, grow according to their own DEB (currently with the same parameters as focals)
+    + Nonfocal snails can also kill/eat eggs of focal snails (as seen for Physa in the tank and lab experiments)
+* Size-selective predation (8/22/2022)
+  + Implemented as an exponential continuous effect, when negative coefficient, based on snail length, when positive, based on difference between maximum length and current shell size
+* Infection-selective predation (3/30/22)
+  + Implemented check for patently shedding snails and patently shedding snails are attacked at relative rate "pred_alpha_Inf"
+* cumulative_totals() function that retains cumulative totals and parameter values
+* Implemented a "simulation space" function to run factorial simulation experiments over (4/1/2022)
+  + DEBIBM_factorial_simulator() function makes
+
+
+### Bug fixes/issues resolved
+* High predation scenarios revealed a bookkeeping problem when only 1 snail is alive (transposing snail.stat matrix)
+  + Fixed this issue by enforcing correct structure with an internal check when there is only one snail (3/1/2022)
+* The Initialize_IBM() function now stores the parameters used in the simulation (3/1/2022)
+
+
+```{r packages}
+
+# Loading packages
+library(Matrix)
+library(deSolve)
+library(ggplot2)
+library(cowplot)
+library(tidyverse)
+library(mc2d)
+theme_set(theme_cowplot())
+
+```
+
+```{r compiled_model}
+
+# Rtools is needed for compiling the .c file of the DEB model
+#rtools <- "C:\\Rtools\\bin"
+#gcc <- "C:\\Rtools\\gcc-4.6.3\\bin"
+#path <- strsplit(Sys.getenv("PATH"), ";")[[1]]
+#new_path <- c(rtools, gcc, path)
+#new_path <- new_path[!duplicated(tolower(new_path))]
+#Sys.setenv(PATH = paste(new_path, collapse = ";"))
+
+# compile my model from C definition
+#try(dyn.unload("C:/RData/IndividualModel_IBM3.dll")) # unload dll
+#system("R CMD SHLIB C:/RData/IndividualModel_IBM3.c")
+#system("/Users/kmbarnett/Desktop/km/IndividualModel_IBM3.c")
+
+
+#https://thecoatlessprofessor.com/programming/cpp/r-compiler-tools-for-rcpp-on-macos/ 
+#https://cran.r-project.org/web/packages/deSolve/vignettes/compiledCode.pdf regarding converting lsoda models into c models - compiling the file
+#install compiler for r
+#make dll file equivalent on my computer - ref system file
+
+```
+
+KMB - compiling C file on a Mac
+```{r}
+
+#step 1: in terminal to convert .c file into an .so file
+#R CMD SHLIB IndividualModel_IBM3.c
+
+#step 2: once c code has been converted to a .so file, use this code for compiling in r:
+dyn.load("/Users/kmbarnett/Desktop/km/IBM3_executable.so")
+
+#step 3 in r:
+#system("gcc -c IndividualModel_IBM3.c  -I/Library/Frameworks/R.framework/Versions/4.2/Resources/include")
+system("gcc -c IndividualModel_IBM3.c -I/Library/Frameworks/R.framework/Versions/4.2/Resources/include") 
+```
+For compiling on a mac:
+```{r}
+dyn.load("/Users/kmbarnett/Desktop/km/IBM3_executable.so")
+system("gcc -c IndividualModel_IBM3.c -I/Library/Frameworks/R.framework/Versions/4.2/Resources/include")
+```
+
+
+```{r}
+# Set the necessary paths for compiling the C file
+#rtools <- "/usr/local/rtools"
+#gcc <- "/usr/local/gcc/bin"
+#path <- strsplit(Sys.getenv("PATH"), ":")[[1]]
+#new_path <- c(rtools, gcc, path)
+#new_path <- new_path[!duplicated(tolower(new_path))]
+#Sys.setenv(PATH = paste(new_path, collapse = ":"))
+
+# Compile the model from C definition
+#try(dyn.unload("/Users/kmbarnett/RData/IndividualModel_IBM3.so")) # unload the shared object if already loaded
+#system("R CMD SHLIB /Users/kmbarnett/RData/IndividualModel_IBM3.c")
+
+```
+
+
+```{r parameters}
+
+# DEB Parameter estimates current as of Civitello et al. 2020 Proc B (Highest posterior density parameters)
+parms = readRDS("/Users/kmbarnett/Desktop/km/Starvation_parameters.RDa")[1:25]
+parms["Fh"] = 2 # f_scaled (for v.1.1)
+parms["yRP"] = parms["yRP"]*17.5 # new yRP = 0.824 * 17.5 (1-8-19)( # old yRP = 0.0471 * (1/0.4) * 7 [expected shedding output per weekly shed * (snails shed 40% of their total cercariae during 9-11 AM.) * 7 days] 
+# This correction factor is explained in supplement of Civitello et al. 2020 Proc B, based on repeated 2 vs 22 hour sheds by RBH
+parms["hb"] = 0.001 # Rounding snail background mortality rate
+
+
+# Adds parameters for the environment, resource production model, and transmission model
+  # Environment and simulation logistics
+parms["ENV"] = 500 # Volume of the environment, Units: L (Assume 0.5 m x 1 m x1 m [d x l x w] volume of water)
+parms["step"] = 1  # time step for DEB model calc, Units: day
+parms["timespan"] = 150 # Timespan of simulations, Units: day
+
+  # Snail egg submodel
+parms["Hatch"] = 0.5 # Hatching probability for snail eggs, Units: -
+
+  # Snail body mass estimation (Apparent wet mass)
+parms["DV"] = 0.0096 # Units: mg dry mass mm^-3 (Empirical weight - length regression; note not units of carbon)
+
+  # Resource submodel
+parms["r"] = 0.25   # Maximum growth rate of edible resources, Units: day-1 (reasonable for periphyton)
+parms["K"] = 5      # Algae Carrying capacity mg C L-1
+parms["Det"] = 0    # Detritus input rate, Units mg C L-1 day-1
+
+  # Snail infection submodel 
+#     # size-independent parameters
+# parms["epsilon"] = 20 # Exposure rate, Units: L host-1, day-1 (Rounded estimate from Civitello and Rohr)
+# parms["sigma"] = 0.5 # Probability of infection given exposure, Units: - (Rounded estimate from Civitello and Rohr)
+parms["epsilon"] = 0.640 # Exposure rate, Units: L host-1, day-1 (from Becky and Kelsey)
+parms["sigma"] = 0.151 # Probability of infection given exposure, Units: - (from Becky and Kelsey)
+    #size-dependent parameters
+parms["epsilon0"] = 0.226
+parms["epsilonL"] = 0.184
+parms["sigma0"] = 0.619
+parms["sigmaL"] = -0.216
+parms["SS_transmission"] = TRUE
+
+parms["m_M"] = 1   # Death rate of miracidia in the environment, Units: day-1
+parms["M_in"] = 0 # Introduction rate of miracidia into the environment, Units: # day-1
+
+  # Human infection submodel
+parms["epsilon_H"] = 10 # Exposure rate, Units: L host-1, day-1 (from Becky and Kelsey)
+parms["sigma_H"] = 0.5 # Probability of infection given exposure, Units: - (from Becky and Kelsey)
+parms["m_Z"] = 1   # Death rate of cercariae in the environment, Units: day-1
+parms["W_0"] = 100
+parms["B_0"] = 1.69 # Parameters for log-linear production of eggs from worm pairs per person (for 10 mL urine)
+parms["B_1"] = 0.29 # Parameters for log-linear production of eggs from worm pairs per person (for 10 mL urine)
+parms["d"] = 0.67 # Parameter for the daily development rate of juvenile schistosomes in humans
+parms["m"] = 0.025 # Parameter for daily death rate of juvenile schistosomes in humans
+parms["m_W"] = 5e-4 # Parameter for daily death rate of adult schistosomes in humans
+
+  # Predatory biocontrol parameters
+parms["pred_N"] = 0 # Initial predator abundance, Units: - (so predator density = pred_N/ENV = #/L)
+parms["pred_a0"] = 1/parms["ENV"] # maximum predator search rate; (Units = ENVs swept per day, est = 9.1 L swept per 10 L tank  (Sokolow et al. 2014 acta tropica)
+parms["pred_aL"] = -0.01
+parms["pred_ht"] = 1/10
+parms["pred_alpha_Inf"] = 1
+
+  # Resistant competitor parameters
+parms["egg_f"] = 1e-5 # Relative egg consumption rate
+
+```
+
+```{r DEB_function}
+
+# DEB() simulations one time step of a DEB model for one snail in a potentially shared environment
+DEB = function(step, Food, L, e, D, RH, P, RP, DAM, HAZ, iM, k, M, EM, 
+               Fh, muD, DR, yRP, ph, yPE, iPM, eh, mP, alpha, yEF,
+               LM, kd, z, kk, hb, theta, mR, yVE, ENV, Lp, SAtotal, r, K, Det, Focal){
+  # starting conditions 
+  initials = c(Food=Food, L=L, e=e, D=D, RH=RH, P=P, RP=RP, DAM=DAM, HAZ=HAZ)
+  # deb parameters
+  parameters = c(iM, k, M, EM, Fh, muD, DR, yRP, ph, yPE, iPM,
+                 eh, mP, alpha, yEF, LM, kd, z, kk, hb, theta, mR, yVE, ENV, Lp, SAtotal, r, K, Det)
+  # estimate starting deb conditions using fitted params by solving ode's
+  ## return survival and host shell length  
+  DEBstep <- lsoda(initials, c(0,step), func = "derivs", dllname = "IBM3_executable", 
+                   initfunc = "initmod",  nout=2, outnames=c("Survival", "LG"), maxsteps=500000,
+                   as.numeric(parameters),  rtol=1e-6, atol=1e-6, hmax=1)
+  c(DEBstep[2, 2:12], "Focal" = Focal) # 12 = survival
+}
+
+
+```
+
+```{r Infection_function}
+### Exposure submodel
+Infection = function(snail.stats, miracidia, parameters){
+  # Parameters
+  epsilon = as.numeric(parameters["epsilon"])
+  sigma = as.numeric(parameters["sigma"])
+  ENV = as.numeric(parameters["ENV"])
+  m_M = as.numeric(parameters["m_M"])
+  step = as.numeric(parameters["step"])
+  
+  # Later calculations depend on exposure probabilities
+  exp.rates =epsilon*(snail.stats[,"L"]>0)/ENV # This gives uniform exposure rates for all snails
+  sum.exp.rates = sum(exp.rates)
+  
+  # Probabilities for fate of miracidia
+  P.left.in.water = exp(-(m_M+sum(exp.rates))*step)                             # Still in water
+  P.infects.this.snail = (1 - P.left.in.water)*(sigma*exp.rates/(m_M+sum.exp.rates))  # Infect a snail
+  # Die in water or fail to infect
+  P.dead = (1 - P.left.in.water)*(m_M/(m_M+sum.exp.rates)) + sum((1 - P.left.in.water)*((1-sigma)*exp.rates/(m_M+sum.exp.rates))) # die
+  
+  prob.vector = c(P.infects.this.snail, P.left.in.water, P.dead)
+  
+  # Multinomial outcome
+  rmultinom(n=1, size=miracidia, prob=prob.vector)
+}
+```
+
+```{r SizeStructured_infection_function}
+### Exposure submodel
+Infection_SS = function(snail.stats, miracidia, parameters){
+  # Parameters
+  epsilon0 = as.numeric(parameters["epsilon0"])
+  sigma0 = as.numeric(parameters["sigma0"])
+  epsilonL = as.numeric(parameters["epsilonL"])
+  sigmaL = as.numeric(parameters["sigmaL"])
+  ENV = as.numeric(parameters["ENV"])
+  m_M = as.numeric(parameters["m_M"])
+  step = as.numeric(parameters["step"])
+  
+  # Later calculations depend on exposure probabilities and sigmas, which are size-dept
+  exp.rates =epsilon0*exp(epsilonL*snail.stats[,"L"])/ENV # This gives size-dependent exposure rates
+  sum.exp.rates = sum(exp.rates)
+  sigmas = sigma0*snail.stats[,"Focal"]*exp(sigmaL*snail.stats[,"L"])
+  
+  # Probabilities for fate of miracidia
+  P.left.in.water = exp(-(m_M+sum(exp.rates))*step)                             # Still in water
+  P.infects.this.snail = (1 - P.left.in.water)*(sigmas*exp.rates/(m_M+sum.exp.rates))  # Infect a snail
+  # Die in water or fail to infect
+  P.dead = (1 - P.left.in.water)*(m_M/(m_M+sum.exp.rates)) + sum((1 - P.left.in.water)*((1-sigmas)*exp.rates/(m_M+sum.exp.rates))) # die
+  
+  prob.vector = c(P.infects.this.snail, P.left.in.water, P.dead)
+  
+  # Multinomial outcome
+  rmultinom(n=1, size=miracidia, prob=prob.vector)
+}
+```
+
+```{r Human_Infection_function}
+
+Human_Infection = function(human.stats, cercariae, parameters){
+  # Parameters
+  epsilon_H = as.numeric(parameters["epsilon_H"])
+  sigma_H = as.numeric(parameters["sigma_H"])
+  ENV = as.numeric(parameters["ENV"])
+  m_Z = as.numeric(parameters["m_Z"])
+  step = as.numeric(parameters["step"])
+  
+  # Later calculations depend on exposure probabilities
+  exp.rates =epsilon_H*(human.stats[,"A"]>0)/ENV # This gives uniform exposure rates for all humans
+  sum.exp.rates = sum(exp.rates)
+  
+  # Probabilities for fate of miracidia
+  P.left.in.water = exp(-(m_Z+sum(exp.rates))*step)                             # Still in water
+  P.infects.this.human = (1 - P.left.in.water)*(sigma_H*exp.rates/(m_Z+sum.exp.rates))  # Infect a human
+  # Die in water or fail to infect
+  P.dead = (1 - P.left.in.water)*(m_Z/(m_Z+sum.exp.rates)) + sum((1 - P.left.in.water)*((1-sigma_H)*exp.rates/(m_Z+sum.exp.rates))) # die
+  
+  prob.vector = c(P.infects.this.human, P.left.in.water, P.dead)
+  
+  # Multinomial outcome
+  rmultinom(n=1, size=cercariae, prob=prob.vector)
+}
+
+
+
+Worm_development = function(Human.stats, parameters){
+  new_Human.stats = Human.stats
+  for(i in 1:dim(Human.stats)[1]){
+    juveniles = Human.stats[i,3:29]
+    #trying to figure out how to incorporate juvenile worm mortality
+    #mortality.luck = runif(juveniles, min=0, max=1)
+    #survival.during.development = mortality.luck >= 0.025
+    #mortality.luck >= 1 - exp(-snail.update[,"HAZ"])
+    Adults = Human.stats[i,30]
+    juv.develop = rbinom(n = length(juveniles), size = juveniles, prob = parameters["d"])
+    new.juveniles = juveniles - juv.develop
+    new.juveniles[2:27] = new.juveniles[2:27] + juv.develop[1:26]
+    new.Adults = Adults + juv.develop[27]
+    new_Human.stats[i, 3:30] = c(new.juveniles, new.Adults)
+  }
+  new_Human.stats[,"t"] = new_Human.stats[,"t"] +1
+  new_Human.stats
+}
+
+Egg_deposition = function(Human.stats, parameters){
+  sum(rpois(n =dim(Human.stats)[1], lambda= parameters["B_0"]*Human.stats[,30]^parameters["B_1"]))
+}
+```
+
+```{r Human_Infection_function}
+
+Worm_development_and_mortality = function(Human.stats, parameters){
+  new_Human.stats = Human.stats
+  for(i in 1:dim(Human.stats)[1]){
+    juveniles = Human.stats[i,3:29]
+    Adults = Human.stats[i,30]
+    prob.vector = c(parameters["d"], parameters["m"], 1-(parameters["d"]+parameters["m"]))
+    juv.transitions = rmultinomial(n= length(juveniles), size = juveniles, prob=prob.vector)
+    juv.develop = juv.transitions[,1] 
+    juv.die = juv.transitions[,2] #juveniles that died
+    juv.stay = juv.transitions[,3] #juveniles that did not develop or die
+    new.juveniles = juv.stay + c(0,juv.develop[1:26])
+    new.Adults = rbinom(n = 1, size = Adults, prob = 1-parameters["m_W"])+ juv.develop[27]
+    new_Human.stats[i, 3:30] = c(new.juveniles, new.Adults)
+  }
+  new_Human.stats[,"t"] = new_Human.stats[,"t"] +1
+  new_Human.stats[,"A"] = new_Human.stats[,"A"] + (1/365)
+  new_Human.stats
+}
+stats1 = Initialize_IBM(60,0,10,2,16,1)
+Worm_development_and_mortality(Human.stats = stats1$Humans[[1]], parms)
+
+```
+
+
+```{r initialize_IBM}
+
+Initialize_IBM = function(N.snail, N.comp, N.human, min.L, max.L, Food, pars=parms){
+  L = runif(N.snail + N.comp, min = min.L, max = max.L)
+  e = 0.9
+  # Compile snail and competitor statistics
+  snail.stats = cbind("ID" = 1:N.snail, "L" = L[1:N.snail], "e" = e, "D" = rep(0, times=N.snail), "RH" = rep(0, times=N.snail),
+                      "P" = rep(0, times=N.snail), "RP" = rep(0, times=N.snail), "DAM" = rep(0, times=N.snail),
+                      "HAZ" = rep(0, times=N.snail), "LG" = L[1:N.snail], 
+                      "DEBmass" = pars["M"]*((1 + e*pars["EM"])/(1 + pars["EM"]))*L[1:N.snail]^3, 
+                      "Appmass" = pars["DV"]*L[1:N.snail]^3, "repro" = rep(0, times=N.snail), "Cercs" = rep(0, times=N.snail), 
+                      "t" = rep(0, times=N.snail), "Focal" = rep(1, times=N.snail))
+  if(N.comp > 0){
+    comp.stats = cbind("ID" = (N.snail+1):(N.snail+N.comp), "L" = L[(N.snail+1):(N.snail+N.comp)], "e" = e, 
+                      "D" = rep(0, times=N.comp), "RH" = rep(0, times=N.comp),
+                      "P" = rep(0, times=N.comp), "RP" = rep(0, times=N.comp), "DAM" = rep(0, times=N.comp),
+                      "HAZ" = rep(0, times=N.comp), "LG" = L[(N.snail+1):(N.snail+N.comp)], 
+                      "DEBmass" = pars["M"]*((1 + e*pars["EM"])/(1 + pars["EM"]))*L[(N.snail+1):(N.snail+N.comp)]^3, 
+                      "Appmass" = pars["DV"]*L[(N.snail+1):(N.snail+N.comp)]^3, "repro" = rep(0, times=N.comp), "Cercs" = rep(0, times=N.comp), 
+                      "t" = rep(0, times=N.comp), "Focal" = rep(0, times=N.comp))
+    snail.stats = rbind(snail.stats, comp.stats)
+  }
+  # Compile human statistics
+    human.stats = cbind("ID" = 1:N.human, "A" = 5,
+                      matrix(0, nrow=N.human, ncol=27, dimnames = list(c(), paste0(rep("J", times=27), 1:27))), 
+                      "Adults" = rpois(n=N.human, lambda = pars["W_0"]), "t" = rep(0, times=N.human))
+  # Return all starting statistics
+  list("Snails" = list(snail.stats), "Humans" = list(human.stats), "Env_F" = Food, "Env_M" = 0, "Env_Z" = 0, "Env_G" = 0, "Env_RG" = 0,
+       "Pred_L" = 0, "Pred_N" = 0, "Parameters" = pars)
+}
+```
+
+```{r simulate_IBM}
+
+run_DEB_IBM = function(N.snail=60, N.comp=0, N.human=10, min.L=2, max.L=16, Food=1, drip=T, pars){
+
+  # Set up initial conditions, data structures
+  state = Initialize_IBM(N.snail, N.comp, N.human, min.L, max.L, Food, pars)
+  Env_G = numeric()
+  Env_RG = numeric() # eggs of resistant competitor
+  snail.IDs = length(state$Snails[[1]][,"ID"])
+  
+
+  # run the IBM
+  for(tick in 1:pars["timespan"]){
+    #Daily check for time-varying parameters
+    if(drip == F){pars["M_in"] = ifelse( tick %in% c(1, 15, 29, 43), 140, 0)}
+    
+    # Get environmental stats
+    environment = c("F" = state$Env_F[tick], "M" = state$Env_M[tick], "Z" = state$Env_Z[tick], 
+                    "G" = state$Env_G[tick], "RG" = state$Env_RG[tick])
+    
+    # Let worms develop within humans
+    state$Humans[[tick+1]] = Worm_development_and_mortality(state$Humans[[tick]], pars)
+    
+    # Simulate human contact
+    New_human_infections = Human_Infection(human.stats = state$Humans[[tick]], cercariae = environment[3], parameters=pars)
+      # Add successful infections to the "J1" state
+    state$Humans[[tick+1]][,"J1"] = state$Humans[[tick+1]][,"J1"] + New_human_infections[1:N.human]
+
+    # Simulate snails
+    if(dim(state$Snails[[tick]])[1] > 0){
+      # set host variables
+      snail.stats = state$Snails[[tick]]
+      N.snails = length(snail.stats[,"LG"]) # total number of snails
+      Inf.snails = sum(state$Snails[[tick]][,"Cercs"] > 0) # number of patently shedding snails
+      Uninf.snails = sum(state$Snails[[tick]][,"Cercs"] == 0) # number of non-shedding snails
+      if(N.snails != Inf.snails + Uninf.snails){stop("Miscalculating infection status")}
+      # Infect snails
+      if(pars["SS_transmission"] == TRUE){ # Are we using size-structured transmission?
+        Infection.step = as.vector(Infection_SS(snail.stats, environment[2], pars)) # Who gets infected
+      }else{
+        Infection.step = as.vector(Infection(snail.stats, environment[2], pars)) # Who gets infected
+      }
+
+      snail.stats[which(Infection.step[1:N.snails] > 0),"P"] = snail.stats[which(Infection.step[1:N.snails] > 0),"P"] + 2.85e-5 
+      
+      # Determine snail mortality rates due to size- and infection-selective predation
+      # pred_as = pars["pred_a0"]*exp(pars["pred_aL"]*(snail.stats[,"L"]))*(1 + (snail.stats[,"Cercs"]>0)*pars["pred_alpha_Inf"])
+      
+            # Determine snail mortality rates due to size- and infection-selective predation
+      pred_as = ifelse(pars["pred_a0"] < 0,
+        pars["pred_a0"]*exp(pars["pred_aL"]*(snail.stats[,"LG"]))*(1 + (snail.stats[,"Cercs"]>0)*pars["pred_alpha_Inf"]),
+        pars["pred_a0"]*exp(-pars["pred_aL"]*(pars["LM"] -  snail.stats[,"LG"]))*(1 +   
+        (snail.stats[,"Cercs"]>0)*pars["pred_alpha_Inf"]))
+      
+      hb = as.numeric(pars["hb"]) + (pred_as*pars["pred_N"]) / (1 + mean(pred_as) * pars["pred_ht"] * N.snails)
+
+      # Update DEBS, HAZ=0 so survival probs are calculated for the current day
+      snail.update = t(mapply(DEB, L=snail.stats[,"L"], e=snail.stats[,"e"], D=snail.stats[,"D"], RH=snail.stats[,"RH"],
+                              P=snail.stats[,"P"], RP=snail.stats[,"RP"], DAM=snail.stats[,"DAM"], Lp=snail.stats[,"LG"], hb=hb, Focal = snail.stats[,"Focal"],
+                              MoreArgs = list(step=1, HAZ=0, Food=as.numeric(environment["F"]),
+                                              iM=pars["iM"], k=pars["k"], M=pars["M"], EM=pars["EM"], Fh=pars["Fh"], 
+                                              muD=pars["muD"],
+                                              DR=pars["DR"], yRP=pars["yRP"], ph=pars["ph"], yPE=pars["yPE"], iPM=pars["iPM"], eh=pars["eh"],
+                                              mP=pars["mP"], alpha=pars["alpha"], yEF=pars["yEF"], LM=pars["LM"], kd=pars["kd"], z=pars["z"], 
+                                              kk=pars["kk"], 
+                                              #hb=pars["hb"], #no longer constant for all sizes due to predation
+                                              theta=pars["theta"], mR=pars["mR"], yVE=pars["yVE"], 
+                                              SAtotal= sum(snail.stats[,"L"]^2), 
+                                              ENV=pars["ENV"], r=pars["r"], K=pars["K"], 
+                                              Det=pars["Det"]))) # detritus (Det) defined in C file
+      
+      snail.update[is.nan(snail.update)] <- 0 # turn nans from matrix into 0
+
+      # Calculate some useful individual-level stuff
+      DEBmass = pars["M"]*((1 + snail.update[,"e"]*pars["EM"])/(1 + pars["EM"]))*snail.update[,"L"]^3
+      Appmass = pars["DV"]*snail.update[,"LG"]^3
+      
+      Eggs = floor(snail.update[,"RH"]*snail.update[,"Focal"]/0.015)  # Figure out how many (whole) eggs are released
+      R_Eggs = floor(snail.update[,"RH"]*(1-snail.update[,"Focal"])/0.015)  # Figure out how many (whole) eggs are released by competitors
+      snail.update[,"RH"] = snail.update[,"RH"] %% 0.015        # Remove released cercariae from the buffer
+      Cercs = floor(snail.update[,"RP"]/4e-5)  # Figure out how many (whole) cercs are released
+      snail.update[,"RP"] = snail.update[,"RP"] %% 4e-5         # Remove released cercariae from buffer
+      
+      # Store calculated individual-level stuff
+      snail.update = cbind(snail.update, "DEBmass" = DEBmass, "Appmass" = Appmass, "repro" = Eggs, "Cercs" = Cercs, "t" = rep(tick, times=length(Cercs)))
+      
+      # Snails have to survive the day
+      mortality.luck = runif(N.snails, min=0, max=1)
+      
+      # hb <- hb + (pred_a * pred_p) / (1 + pred_a * pred_h * N.snails)
+      surviving = mortality.luck >= 1 - exp(-snail.update[,"HAZ"])
+
+      
+      # Something had been going wrong when only one snail survives, this retains the correct data structure
+      if(length(which(surviving == TRUE)) == 1){
+        state$Snails[[tick+1]] = cbind("ID" =  snail.stats[which(surviving == TRUE), "ID"],
+                                       "L" =  snail.stats[which(surviving == TRUE), "L"], 
+                                       "e" =  snail.stats[which(surviving == TRUE), "e"], 
+                                       "D" =  snail.stats[which(surviving == TRUE), "D"], 
+                                       "RH" =  snail.stats[which(surviving == TRUE), "RH"],
+                                       "P" =  snail.stats[which(surviving == TRUE), "P"],
+                                       "RP" =  snail.stats[which(surviving == TRUE), "RP"],
+                                       "DAM" =  snail.stats[which(surviving == TRUE), "DAM"],
+                                       "HAZ" =  snail.stats[which(surviving == TRUE), "HAZ"],
+                                       "LG" =  snail.stats[which(surviving == TRUE), "LG"],
+                                       "DEBmass" =  snail.stats[which(surviving == TRUE), "DEBmass"],
+                                       "Appmass" =  snail.stats[which(surviving == TRUE), "Appmass"],
+                                       "repro" =  snail.stats[which(surviving == TRUE), "repro"],
+                                       "Cercs" =  snail.stats[which(surviving == TRUE), "Cercs"],
+                                       "t" =  snail.stats[which(surviving == TRUE), "t"],
+                                       "Focal" =  snail.stats[which(surviving == TRUE), "Focal"])}else{
+        # This is the normal step, that worked just fine when N.snails > 1
+        state$Snails[[tick+1]] = cbind("ID" = snail.stats[which(surviving == TRUE), "ID"],  snail.update[which(surviving == TRUE),c("L", "e", "D", "RH", 
+                                "P", "RP", "DAM", "HAZ", "LG", "DEBmass", "Appmass", "repro", "Cercs", "t", "Focal")])
+        }
+      
+      # Update environment
+      state$Env_F[tick+1] = max(0, snail.update[1,"Food"])
+      #state$Env_M[tick+1] = as.numeric(Infection.step[N.snails + 1] + pars["M_in"]) # total miracidia density 
+      #state$Env_Z[tick+1] = as.numeric(environment[3]*exp(-pars["m_Z"]*pars["step"]) + sum(Cercs)/pars["ENV"]) # total cerc density
+      state$Env_M[tick+1] = as.numeric(Infection.step[N.snails + 1] + Egg_deposition(state$Humans[[tick]], pars)) # total miracidia density 
+      state$Env_Z[tick+1] = New_human_infections[N.human+1] + sum(Cercs)
+      
+    }else{ # if there are no hosts  
+      
+      #state$Env_M[tick+1] = as.numeric(environment[2]*exp(-pars["m_M"]*pars["step"]) + pars["M_in"]) # total miracidia density 
+      #state$Env_Z[tick+1] = as.numeric(environment[3]*exp(-pars["m_Z"]*pars["step"])) # total cerc density
+      state$Env_M[tick+1] = as.numeric(environment[2]*exp(-pars["m_M"]*pars["step"]) + Egg_deposition(state$Humans[[tick]], pars)) # total miracidia density 
+      state$Env_Z[tick+1] = New_human_infections[N.human+1]   
+      state$Env_F[tick+1] = ifelse(pars["Det"] == 0, as.numeric(pars["K"]*environment[1]/(environment[1] + (pars["K"] -
+                         environment[1])*exp(-pars["r"]*pars["step"]))), as.numeric(environment[1] + pars["Det"]))
+      Eggs <- 0
+      R_Eggs <- 0
+      
+      # need to keep data structure when no (hatched) individuals
+      state$Snails[[tick+1]] = matrix(ncol=15, nrow=0) 
+      colnames(state$Snails[[tick+1]]) = c("ID", "L", "e", "D", "RH", "P", "RP", "DAM", "HAZ", "LG", "DEBmass", "Appmass", "repro", "Cercs", "t")
+    }
+    
+    state$Env_G[tick+1] = max(0, sum(Eggs))
+    state$Env_RG[tick+1] = max(0, sum(R_Eggs)) # Eggs of the resistant competitor
+    
+    # # Egg consumption
+    # Cumulative_Egg_pred = sum(snail.stats[,"L"]^2*(1 - snail.stats[,"Focal"])*pars["egg_f"])
+    # state$Env_G[max(1, (tick - 10)) : (tick-1)] = rbinom(n = length(max(1, (tick - 10)) : (tick-1)), size = state$Env_G[max(1, (tick - 10))  : (tick-1)], 
+    #                                                      prob = 1 - exp(-Cumulative_Egg_pred))
+    # Eggs hatch
+    if(tick > 10){
+      births =  rbinom(n=1, size=state$Env_G[tick - 10], prob=pars["Hatch"])
+      if(births > 0){
+        neonates = cbind("ID" = (snail.IDs+1):(snail.IDs + births), "L" = rep(0.75, births), "e" = rep(0.9, times=births), "D" = rep(0, times=births), 
+                         "RH" = rep(0, times=births),
+                         "P" = rep(0, times=births), "RP" = rep(0, times=births), "DAM" = rep(0, times=births),
+                         "HAZ" = rep(0, times=births), "LG" = rep(0.75, births), "DEBmass" = pars["M"]*((1 + 0.9*pars["EM"])/(1 + pars["EM"]))*0.75^3,
+                         "Appmass" = pars["DV"]*0.75^3, "repro" = rep(0, times=births), "Cercs" = rep(0, times=births), "t" = rep(tick, times=births), 
+                         "Focal" = rep(1, times=births))
+        snail.IDs = snail.IDs + births # Updates the running count of snails
+        state$Snails[[tick+1]] = rbind(state$Snails[[tick+1]], neonates)
+      }
+      comp_births =  rbinom(n=1, size=state$Env_RG[tick - 10], prob=pars["Hatch"])
+      if(comp_births > 0){
+        neonates = cbind("ID" = (snail.IDs+1):(snail.IDs + comp_births), "L" = rep(0.75, comp_births), "e" = rep(0.9, times=comp_births), "D" = rep(0, times=comp_births), 
+                         "RH" = rep(0, times=comp_births),
+                         "P" = rep(0, times=comp_births), "RP" = rep(0, times=comp_births), "DAM" = rep(0, times=comp_births),
+                         "HAZ" = rep(0, times=comp_births), "LG" = rep(0.75, comp_births), "DEBmass" = pars["M"]*((1 + 0.9*pars["EM"])/(1 + pars["EM"]))*0.75^3,
+                         "Appmass" = pars["DV"]*0.75^3, "repro" = rep(0, times=comp_births), "Cercs" = rep(0, times=comp_births), "t" = rep(tick, times=comp_births), "Focal" = rep(0,                                times=comp_births))
+        snail.IDs = snail.IDs + comp_births # Updates the running count of snails
+        state$Snails[[tick+1]] = rbind(state$Snails[[tick+1]], neonates)
+      }
+    }
+    if(tick %% 150 == 0){print(tick)}
+  }
+  return(state)
+}
+
+
+```
+
+```{r catch_and_digest}
+# functions for simulating that observation of snail populations fails to catch small individuals (e.g., in GH we exclude <2 mm)
+catch_snails = function(mat, LG = 2){
+  mat[which(mat[,"LG"] >= LG),]
+}
+
+catch_state = function(state){
+  caught_snails = lapply(state$Snails, FUN=catch_snails)
+  list("Snails" = caught_snails, "Env_F" = state$Env_F, "Env_M" = state$Env_M, "Env_Z" = state$Env_Z, "Env_G" = state$Env_G, "Env_RG" = state$Env_RG)
+}
+
+# Obtain key population-level summary statistics from an IBM run
+digest_state = function(state){
+  span = length(state$Env_F)
+  N.snails = unlist(lapply(state$Snails, FUN=length))/dim(state$Snails[[1]])[2]
+  DEBmass = matrix(unlist(lapply(state$Snails, FUN=colSums)), ncol=dim(state$Snails[[1]])[2], byrow=T)[, which(colnames(state$Snails[[1]]) == "DEBmass")]
+  Human_worms = matrix(unlist(lapply(state$Humans, FUN=colSums)), ncol=dim(state$Humans[[1]])[2], byrow=T)[, which(colnames(state$Humans[[1]]) == "Adults")]
+  Appmass = matrix(unlist(lapply(state$Snails, FUN=colSums)), ncol=dim(state$Snails[[1]])[2], byrow=T)[, which(colnames(state$Snails[[1]]) == "Appmass")]
+  data.frame("time" = 1:span, "Snails" = N.snails, "DEBmass" = DEBmass, "Appmass" = Appmass, "Food" = state$Env_F,
+             "Miracidia" = state$Env_M, "Cercariae" = state$Env_Z, "Eggs" = state$Env_G, "R_Eggs" = state$Env_RG,"Pred_L" = state$Pred_L, 
+             "Pred_N" = state$Pred_N, "Worms" = Human_worms)
+}
+
+# Obtain information on all patently shedding individuals
+digest_i_states = function(state){
+  all_inds = do.call(rbind, state$Snails)
+  inf_inds = subset(data.frame(all_inds), Cercs > 0)
+  inf_inds
+}
+
+digest_i_states2 = function(state){
+  all_inds = do.call(rbind, state$Snails)
+  inf_inds = subset(data.frame(all_inds), Cercs > 0)
+  inf_inds
+}
+
+
+# Compute cumulative totals for simulations over parameter gradients
+cumulative_totals = function(state){
+  round(c(colSums(digest_state(state)), state$Parameters), 2)
+}
+#cumulative_totals(state)
+library("deSolve")
+state = run_DEB_IBM(N.snail = 60, N.comp = 0, pars=parms)
+try(cumulative_totals(state))
+caught_state = catch_state(state)
+
+Infs = digest_i_states(state)
+Infs[,"ID"] = as.factor(Infs[,"ID"])
+
+ggplot(data=Infs, aes(x=L, y=Cercs, group=ID, color=ID)) + geom_line() + theme(legend.position = "none")
+
+result = digest_state(state)
+plot(Worms ~ time, data = result)
+#state$Humans
+
+```
+
+
+```{r}
+digest_human_infections=function(state){
+  span = length(state$Env_F)
+  N.snails = unlist(lapply(state$Snails, FUN=length))/dim(state$Snails[[1]])[2]
+  DEBmass = matrix(unlist(lapply(state$Snails, FUN=colSums)), ncol=dim(state$Snails[[1]])[2], byrow=T)[, which(colnames(state$Snails[[1]]) == "DEBmass")]
+  Human_worms = matrix(unlist(lapply(state$Humans, FUN=colSums)), ncol=dim(state$Humans[[1]])[2], byrow=T)[, which(colnames(state$Humans[[1]]) == "Adults")]
+  Appmass = matrix(unlist(lapply(state$Snails, FUN=colSums)), ncol=dim(state$Snails[[1]])[2], byrow=T)[, which(colnames(state$Snails[[1]]) == "Appmass")]
+  data.frame("time" = 1:span, "Snails" = N.snails, "DEBmass" = DEBmass, "Appmass" = Appmass, "Food" = state$Env_F,
+             "Miracidia" = state$Env_M, "Cercariae" = state$Env_Z, "Eggs" = state$Env_G, "R_Eggs" = state$Env_RG,"Pred_L" = state$Pred_L, 
+             "Pred_N" = state$Pred_N, "Worms" = Human_worms)
+}
+
+
+```
+
+```{r fac_sim}
+
+# A function suitable for replicate() to handle and return the cumulative total summarized output
+# Note: This function has defaults for initialization
+cumulative_DEB_IBM = function(N.snail=50, N.comp=0, N.human=10, min.L=4, max.L=16, Food=1, drip=T, pars=parms){
+  cumulative_totals(run_DEB_IBM(N.snail, N.comp, N.human, min.L, max.L, Food, drip, pars))
+}
+
+Outputs_of_Interest = c("Snails", "DEBmass", "Appmass", "Food", "Miracidia", "Cercariae", "Eggs")
+Parameters_of_Interest = c("r", "K")
+
+DEBIBM_factorial_simulator = function(OoI, PoI, mins, maxs, levels, iterations, pars=parms){ # Factorial simulator for cumulative totals
+  # set up parameter combinations
+  PoI_df = data.frame(matrix(ncol=length(PoI), nrow=levels)) # create an empty dataframe
+  colnames(PoI_df) = PoI
+  for(i in 1:length(PoI)){
+    PoI_df[,i] = seq(mins[i], maxs[i], length.out = levels)
+  }
+  PoI_set = expand.grid(PoI_df) # creates all factorial combinations ## Note, some may be infeasible
+
+  # run first parameter combination batch
+  pars[PoI] = as.numeric(PoI_set[1,])
+  reps = data.frame(t(replicate(n=iterations, cumulative_DEB_IBM(drip=T, pars=pars), simplify=T)))
+  
+  # add sims for other parameter combinations 
+  for( i in 2:dim(PoI_set)[1]){
+    pars[PoI] = as.numeric(PoI_set[i,])
+    #print(pars)
+    add_reps = data.frame(t(replicate(n=iterations, cumulative_DEB_IBM(drip=T, pars=pars), simplify=T)))
+    reps = rbind(reps, add_reps)
+  }
+  # returns back just the Outputs and Parameters of interest ## could be changed to send back all pars for safety
+  subset(reps, select=c(OoI, PoI)) 
+  
+}
+
+facsim_result = DEBIBM_factorial_simulator(OoI=Outputs_of_Interest, PoI=Parameters_of_Interest, mins = c(0.1, 1), maxs = c(0.5, 10), levels = 4, iterations=2)
+
+facsim_Summary = aggregate(Cercariae ~ r*K, FUN=mean, data=facsim_result)
+ 
+ggplot(data=facsim_Summary, aes(x=r, y=Cercariae, group=as.factor(K), colour=as.factor(K))) + geom_point() + geom_line()
+# 
+facsim_Summary2 = aggregate(Snails ~ r*K, FUN=mean, data=facsim_result)
+ggplot(data=facsim_Summary2, aes(x=r, y=Snails, group=as.factor(K), colour=as.factor(K))) + geom_point() + geom_line()
+
+```
+
+
+
+```{r replicate_sims, message=FALSE, echo=FALSE}
+# A function suitable for replicate() to handle and return the pop-level summarized output
+summarized_DEB_IBM = function(N.snail=60, N.comp=0, N.human=10, min.L=2, max.L=16, Food=1, drip=T, pars=parms){
+  digest_state(run_DEB_IBM(N.snail, N.comp, N.human, min.L, max.L, Food, drip, pars=parms))
+}
+
+# Gets the mean and 95% CI from a collection of replicated runs
+summarized_IBM_reps = function(data, endpoint){
+  unlisted_reps = matrix(unlist(data[endpoint,]), nrow=dim(data)[2], ncol=length(data[[endpoint,1]]), byrow=T)
+  rep_mean = apply(X=unlisted_reps, MARGIN = 2, FUN=mean)
+  rep_CI = t(apply(X=unlisted_reps, MARGIN = 2, FUN=quantile, probs=c(0.025, 0.975)))
+  data.frame("time" = 1:length(data[[endpoint,1]]), "Mean" = rep_mean, "CI_L" = rep_CI[,1], "CI_H" = rep_CI[,2])
+}
+
+# Runs replicate simulations with the same conditions; here it is no predators vs. predators
+
+parms["SS_transmission"] = FALSE
+parms["pred_N"] = 0
+rep_states_NoPred = replicate(n=10, summarized_DEB_IBM(drip=T), simplify=T)
+parms["SS_transmission"] = TRUE
+parms["pred_N"] = 0
+rep_states_Pred = replicate(n=10, summarized_DEB_IBM(drip=T), simplify=T)
+
+```
+
+```{r plotting}
+FigS1A_df = data.frame(rbind(summarized_IBM_reps(rep_states_NoPred, "Snails"), summarized_IBM_reps(rep_states_Pred, "Snails")), "M_in" = rep(c("Constant", "Biweekly pulse"), each=parms["timespan"]+1))
+#### Set up means and CIs for supplemental figure ####
+pS1A = ggplot(data=FigS1A_df, aes(x=time, y=Mean/500, group=M_in, colour=M_in)) +
+  xlab(NULL) + ylab(NULL) +
+  #xlab("Day") + ylab(expression(paste("Snail density,  ", L^-1, "± 95% CI"))) +
+  #labs(fill="Miracidia input mode", colour="Miracidia input mode") +  theme(legend.position = c(0.5, 0.25)) + 
+    theme(legend.position = "None") + 
+  geom_line() + geom_ribbon(aes(ymin=CI_L/500, ymax=CI_H/500, colour=NULL, fill=M_in), alpha=0.2) +
+  scale_fill_manual(values=c("red", "black")) +
+  scale_color_manual(values=c("red", "black"))
+
+pS1A
+
+FigS1B_df = data.frame(rbind(summarized_IBM_reps(rep_states_NoPred, "Worms"), summarized_IBM_reps(rep_states_Pred, "Worms")), "M_in" = rep(c("constant", "biweekly pulse"), each=parms["timespan"]+1))
+#### Set up means and CIs for supplemental figure ####
+pS1B = ggplot(data=FigS1B_df, aes(x=time, y=Mean, group=M_in, colour=M_in)) +
+  xlab(NULL) + ylab(NULL) +
+  #xlab("Day") + ylab(expression(paste("Snail density,  ", L^-1, "± 95% CI"))) +  
+  theme(legend.position = "None") + 
+  geom_line() + geom_ribbon(aes(ymin=CI_L, ymax=CI_H, colour=NULL, fill=M_in), alpha=0.2) +
+  scale_fill_manual(values=c("red", "black")) +
+  scale_color_manual(values=c("red", "black"))
+
+pS1B
+
+FigS1C_df = data.frame(rbind(summarized_IBM_reps(rep_states_NoPred, "Food"), summarized_IBM_reps(rep_states_Pred, "Food")), "M_in" = rep(c("constant", "biweekly pulse"), each=parms["timespan"]+1))
+#### Set up means and CIs for supplemental figure ####
+pS1C = ggplot(data=FigS1C_df, aes(x=time, y=Mean, group=M_in, colour=M_in)) +
+  xlab(NULL) + ylab(NULL) +
+  #xlab("Day") + ylab(expression(paste("Snail density,  ", L^-1, "± 95% CI"))) +  
+  theme(legend.position = "None") + 
+  geom_line() + geom_ribbon(aes(ymin=CI_L, ymax=CI_H, colour=NULL, fill=M_in), alpha=0.2) +
+  scale_fill_manual(values=c("red", "black")) +
+  scale_color_manual(values=c("red", "black"))
+
+pS1C
+
+FigS1D_df = data.frame(rbind(summarized_IBM_reps(rep_states_NoPred, "Miracidia"), summarized_IBM_reps(rep_states_Pred, "Miracidia")), "M_in" = rep(c("constant", "biweekly pulse"), each=parms["timespan"]+1))
+#### Set up means and CIs for supplemental figure ####
+pS1D = ggplot(data=FigS1D_df, aes(x=time, y=Mean/500, group=M_in, colour=M_in)) +
+  xlab(NULL) + ylab(NULL) +
+  #xlab("Day") + ylab(expression(paste("Snail density,  ", L^-1, "± 95% CI"))) +  
+  theme(legend.position = "None") + 
+  geom_line() + geom_ribbon(aes(ymin=CI_L/500, ymax=CI_H/500, colour=NULL, fill=M_in), alpha=0.2) +
+  scale_fill_manual(values=c("red", "black")) +
+  scale_color_manual(values=c("red", "black"))
+
+pS1D
+
+spacer = ggplot(data=FigS1A_df, aes(x=time, y=Mean)) +
+  geom_blank() + theme_void()
+
+FigS1 = plot_grid(spacer, pS1A, spacer, pS1B, 
+                  spacer, pS1C, spacer, pS1D,
+                  spacer, spacer, spacer, spacer, 
+                  nrow=3, ncol=4, rel_widths = c(0.05, 1, 0.05, 1), rel_heights = c(1, 1, 0.05)) +
+  # Panel y-axis labels
+  draw_label(expression(paste("Snail density,  ", L^-1, "± 95% CI")), angle=90, x=0.02, y=0.75) +
+  draw_label(expression(paste("Cercariae density,  ", L^-1, "± 95% CI")), angle=90, x=0.52, y=0.75) +
+  draw_label(expression(paste("Resource density, mg C  ", L^-1, "± 95% CI")), angle=90, x=0.02, y=0.25) +
+  draw_label(expression(paste("Miracidia density,  ", L^-1, "± 95% CI")), angle=90, x=0.52, y=0.25) +
+  # X-axis label
+  draw_label("Day", x=0.52, y=0.025) +
+  # Panel labels
+  draw_label("A", x=0.07, y=0.975) +
+  draw_label("B", x=0.59, y=0.975) +
+  draw_label("C", x=0.07, y=0.48) +
+  draw_label("D", x=0.58, y=0.48) 
+  
+FigS1
+
+#save_plot("FigS1_IBM.png", FigS1, ncol=2, nrow=2, base_height=4, base_aspect_ratio = 1.1, dpi=600, units="in")
+
+```
+
+
+
+
+
+
+
+```{r}
+
+## Make supplement figure 2 for gradients of miracidia input and resource productivity
+pars["pred_N"] = 0
+rep_states_pred_N0 = replicate(n=5, summarized_DEB_IBM(), simplify=T)
+pars["pred_N"] = 0.25
+rep_states_pred_N0.25 = replicate(n=5, summarized_DEB_IBM(), simplify=T)
+pars["pred_N"] = 0.5
+rep_states_pred_N0.5 = replicate(n=5, summarized_DEB_IBM(), simplify=T)
+pars["pred_N"] = 1
+rep_states_pred_N1 = replicate(n=5, summarized_DEB_IBM(), simplify=T)
+pars["pred_N"] = 2
+rep_states_pred_N2 = replicate(n=5, summarized_DEB_IBM(), simplify=T)
+
+# pars["M_in"] = 10
+# pars["r"] = 0.05
+# rep_states_r1 = replicate(n=50, summarized_DEB_IBM(), simplify=T)
+# pars["r"] = 0.125
+# rep_states_r2 = replicate(n=50, summarized_DEB_IBM(), simplify=T)
+# pars["r"] = 0.25
+# rep_states_r3 = replicate(n=50, summarized_DEB_IBM(), simplify=T)
+# pars["r"] = 0.5
+# rep_states_r4 = replicate(n=50, summarized_DEB_IBM(), simplify=T)
+# pars["r"] = 1
+# rep_states_r5 = replicate(n=50, summarized_DEB_IBM(), simplify=T)
+
+
+
+d1 = summarized_IBM_reps(rep_states_pred_N0, "Snails")
+d10 = summarized_IBM_reps(rep_states_pred_N0.25, "Snails")
+d100 = summarized_IBM_reps(rep_states_pred_N0.5, "Snails")
+d1000 = summarized_IBM_reps(rep_states_pred_N1, "Snails")
+d10000 = summarized_IBM_reps(rep_states_pred_N2, "Snails")
+
+FigS2A_df = data.frame(rbind(d1, d10, d100, d1000, d10000), "Pred_N" = rep(c(0, 0.25, 0.5, 1, 2), each=dim(d1)[1]))
+FigS2A_df[, "Pred_N"] = as.factor(FigS2A_df[, "Pred_N"])
+
+pS2A = ggplot(data=FigS2A_df, aes(x=time, y=Mean/500, group=Pred_N, colour=Pred_N)) +
+  xlab(NULL) + ylab(NULL) +
+  labs(fill="Predator density", colour="Predator density") +
+  theme(legend.position = c(0.1, 0.825)) + 
+  geom_line() + geom_ribbon(aes(ymin=CI_L/500, ymax=CI_H/500, colour=NULL, fill=Pred_N), alpha=0.2) +
+  scale_fill_manual(values=c("#2166ac", "black", "#d6604d", "#cb181d", "#67001f")) +
+  scale_color_manual(values=c("#2166ac", "black", "#d6604d", "#cb181d", "#67001f"))
+
+pS2A
+
+
+d1 = summarized_IBM_reps(rep_states_pred_N0, "Cercariae")
+d10 = summarized_IBM_reps(rep_states_pred_N0.25, "Cercariae")
+d100 = summarized_IBM_reps(rep_states_pred_N0.5, "Cercariae")
+d1000 = summarized_IBM_reps(rep_states_pred_N1, "Cercariae")
+d10000 = summarized_IBM_reps(rep_states_pred_N2, "Cercariae")
+
+FigS2C_df = data.frame(rbind(d1, d10, d100, d1000, d10000), "Pred_N" = rep(c(0, 0.25, 0.5, 1, 2), each=dim(d1)[1]))
+FigS2C_df [, "Pred_N"] = as.factor(FigS2C_df [, "Pred_N"])
+
+pS2C = ggplot(data=FigS2C_df, aes(x=time, y=Mean, group=Pred_N, colour=Pred_N)) +
+  xlab(NULL) + ylab(NULL) +
+  theme(legend.position = "None") + 
+  geom_line() + geom_ribbon(aes(ymin=CI_L, ymax=CI_H, colour=NULL, fill=Pred_N), alpha=0.2) +
+  scale_fill_manual(values=c("#2166ac", "black", "#d6604d", "#cb181d", "#67001f")) +
+  scale_color_manual(values=c("#2166ac", "black", "#d6604d", "#cb181d", "#67001f"))
+
+pS2C
+
+d1 = summarized_IBM_reps(rep_states_pred_N0, "Food")
+d10 = summarized_IBM_reps(rep_states_pred_N0.25, "Food")
+d100 = summarized_IBM_reps(rep_states_pred_N0.5, "Food")
+d1000 = summarized_IBM_reps(rep_states_pred_N1, "Food")
+d10000 = summarized_IBM_reps(rep_states_pred_N2, "Food")
+
+FigS2E_df = data.frame(rbind(d1, d10, d100, d1000, d10000), "Pred_N" = rep(c(0, 0.25, 0.5, 1, 2), each=dim(d1)[1]))
+FigS2E_df [, "Pred_N"] = as.factor(FigS2E_df [, "Pred_N"])
+
+pS2E = ggplot(data=FigS2E_df, aes(x=time, y=Mean, group=Pred_N, colour=Pred_N)) +
+  xlab(NULL) + ylab(NULL) +
+  theme(legend.position = "None") + 
+  geom_line() + geom_ribbon(aes(ymin=CI_L, ymax=CI_H, colour=NULL, fill=Pred_N), alpha=0.2) +
+  scale_fill_manual(values=c("#2166ac", "black", "#d6604d", "#cb181d", "#67001f")) +
+  scale_color_manual(values=c("#2166ac", "black", "#d6604d", "#cb181d", "#67001f"))
+
+pS2E
+
+
+# d1 = summarized_IBM_reps(rep_states_r1, "Snails")
+# d10 = summarized_IBM_reps(rep_states_r2, "Snails")
+# d100 = summarized_IBM_reps(rep_states_r3, "Snails")
+# d1000 = summarized_IBM_reps(rep_states_r4, "Snails")
+# d10000 = summarized_IBM_reps(rep_states_r5, "Snails")
+# 
+# FigS2B_df = data.frame(rbind(d1, d10, d100, d1000, d10000), "r" = rep(c(0.05, 0.125, 0.25, 0.5, 1), each=dim(d1)[1]))
+# FigS2B_df[, "r"] = as.factor(FigS2B_df[, "r"])
+# 
+# 
+# pS2B = ggplot(data=FigS2B_df, aes(x=time, y=Mean/500, group=r, colour=r)) +
+#   xlab(NULL) + ylab(NULL) +
+#   labs(fill=expression(paste("Resource productivity,  ", d^-1)),
+#        colour=expression(paste("Resource productivity,  ", d^-1))) +
+#   theme(legend.position = c(0.1, 0.825)) + 
+#   geom_line() + geom_ribbon(aes(ymin=CI_L/500, ymax=CI_H/500, colour=NULL, fill=r), alpha=0.2) +
+#   scale_fill_manual(values=c("#2166ac", "#92c5de", "black", "#cb181d", "#67001f")) +
+#   scale_color_manual(values=c("#2166ac", "#92c5de", "black", "#cb181d", "#67001f"))
+# 
+# pS2B
+# 
+# 
+# d1 = summarized_IBM_reps(rep_states_r1, "Cercariae")
+# d10 = summarized_IBM_reps(rep_states_r2, "Cercariae")
+# d100 = summarized_IBM_reps(rep_states_r3, "Cercariae")
+# d1000 = summarized_IBM_reps(rep_states_r4, "Cercariae")
+# d10000 = summarized_IBM_reps(rep_states_r5, "Cercariae")
+# 
+# FigS2D_df = data.frame(rbind(d1, d10, d100, d1000, d10000), "r" = rep(c(0.05, 0.125, 0.25, 0.5, 1), each=dim(d1)[1]))
+# FigS2D_df[, "r"] = as.factor(FigS2D_df[, "r"])
+# 
+# pS2D = ggplot(data=FigS2D_df, aes(x=time, y=Mean, group=r, colour=r)) +
+#   xlab(NULL) + ylab(NULL) +
+#   theme(legend.position = "None") + 
+#   geom_line() + geom_ribbon(aes(ymin=CI_L, ymax=CI_H, colour=NULL, fill=r), alpha=0.2) +
+#   scale_fill_manual(values=c("#2166ac", "#92c5de", "black", "#cb181d", "#67001f")) +
+#   scale_color_manual(values=c("#2166ac", "#92c5de", "black", "#cb181d", "#67001f"))
+# 
+# 
+# pS2D
+# 
+# d1 = summarized_IBM_reps(rep_states_r1, "Food")
+# d10 = summarized_IBM_reps(rep_states_r2, "Food")
+# d100 = summarized_IBM_reps(rep_states_r3, "Food")
+# d1000 = summarized_IBM_reps(rep_states_r4, "Food")
+# d10000 = summarized_IBM_reps(rep_states_r5, "Food")
+# 
+# FigS2F_df = data.frame(rbind(d1, d10, d100, d1000, d10000), "r" = rep(c(0.05, 0.125, 0.25, 0.5, 1), each=dim(d1)[1]))
+# FigS2F_df[, "r"] = as.factor(FigS2F_df[, "r"])
+# 
+# 
+# pS2F = ggplot(data=FigS2F_df, aes(x=time, y=Mean, group=r, colour=r)) +
+#   xlab(NULL) + ylab(NULL) +
+#   theme(legend.position = "None") + 
+#   geom_line() + geom_ribbon(aes(ymin=CI_L, ymax=CI_H, colour=NULL, fill=r), alpha=0.2) +
+#   scale_fill_manual(values=c("#2166ac", "#92c5de", "black", "#cb181d", "#67001f")) +
+#   scale_color_manual(values=c("#2166ac", "#92c5de", "black", "#cb181d", "#67001f"))
+# 
+# 
+# pS2F
+
+# FigS2 = plot_grid(spacer, pS2A, pS2B, 
+#                   spacer, pS2C, pS2D,
+#                   spacer, pS2E, pS2F,
+#                   spacer, spacer, spacer, 
+#                   nrow=4, ncol=3, align="hv", rel_widths = c(0.05, 1, 1), rel_heights = c(1, 1, 1, 0.05)) +
+#   # Panel y-axis labels
+#   draw_label(expression(paste("Snail density,  ", L^-1, "± 95% CI")), angle=90, x=0.02, y=0.85) +
+#   draw_label(expression(paste("Cercariae density,  ", L^-1, "± 95% CI")), angle=90, x=0.02, y=0.52) +
+#   draw_label(expression(paste("Resource density, mg C  ", L^-1, "± 95% CI")), angle=90, x=0.02, y=0.2) +
+#   # X-axis label
+#   draw_label("Day", x=0.52, y=0.025) +
+#   # Panel labels
+#   draw_label("A", x=0.095, y=0.98) +
+#   draw_label("B", x=0.58, y=0.98) +
+#   draw_label("C", x=0.095, y=0.65) +
+#   draw_label("D", x=0.58, y=0.65) +
+#   draw_label("E", x=0.095, y=0.32) +
+#   draw_label("F", x=0.58, y=0.32)
+
+#save_plot("FigS2_IBM.png", FigS2, ncol=2, nrow=3, base_height=4, base_aspect_ratio = 1.1, dpi=600, units="in")
+
+```
