@@ -29,7 +29,7 @@ Simulations to examine the effects of simultaneous size-dependent transmission a
     + Nonfocal snails compete for algae, grow according to their own DEB (currently with the same parameters as focals)
     + Nonfocal snails can also kill/eat eggs of focal snails (as seen for Physa in the tank and lab experiments)
 * Size-selective predation (8/22/2022)
-  + Implemented as an exponential continous effect, when negative coefficient, based on snail length, when positive, based on difference between maximum length and current shell size
+  + Implemented as an exponential continuous effect, when negative coefficient, based on snail length, when positive, based on difference between maximum length and current shell size
 * Infection-selective predation (3/30/22)
   + Implemented check for patently shedding snails and patently shedding snails are attacked at relative rate "pred_alpha_Inf"
 * cumulative_totals() function that retains cumulative totals and parameter values
@@ -132,6 +132,9 @@ parms["pred_alpha_Inf"] = 1
 
   # Resistant competitor parameters
 parms["egg_f"] = 1e-5 # Relative egg consumption rate
+
+  # Worm development submodel
+parms["worm_r"] = 0.67
 
 ```
 
@@ -245,7 +248,7 @@ Worm_development = function(Human.stats, parameters){
   for(i in 1:dim(Human.stats)[1]){
     juveniles = Human.stats[i,3:29]
     Adults = Human.stats[i,30]
-    juv.develop = rbinom(n = length(juveniles), size = juveniles, prob = parameters["r"])
+    juv.develop = rbinom(n = length(juveniles), size = juveniles, prob = parameters["worm_r"])
     new.juveniles = juveniles - juv.develop
     new.juveniles[2:27] = new.juveniles[2:27] + juv.develop[1:26]
     new.Adults = Adults + juv.develop[27]
